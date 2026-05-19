@@ -8,8 +8,8 @@ from selenium.webdriver.edge.options import Options
 
 BASE_URL_1 = "https://bi.61info.cn/smartbi/vision/openresource.jsp?resid=I2c9280870193d0dcd0dc8f480193ed733b606832"
 BASE_URL_2 = "https://bi.61info.cn/smartbi/vision/openresource.jsp?resid=I2c928087019444dd44dd5dc901944a9a09e444c0"
-USERNAME = "72389"
-PASSWORD = "12345678"
+USERNAME = ""
+PASSWORD = ""
 DOWNLOAD_DIR = r"C:\Users\wangxiaoyu02\工作项目\工作报表\trae分析项目\周报结论"
 
 def get_timestamp_filename(original_name):
