@@ -1,16 +1,61 @@
 import time
 import os
+import json
 import datetime
 import openpyxl
 from openpyxl import Workbook
+from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.edge.options import Options
 
-BASE_URL_1 = "https://bi.61info.cn/smartbi/vision/openresource.jsp?resid=I2c9280870193d0dcd0dc8f480193ed733b606832"
-BASE_URL_2 = "https://bi.61info.cn/smartbi/vision/openresource.jsp?resid=I2c928087019444dd44dd5dc901944a9a09e444c0"
-USERNAME = ""
-PASSWORD = ""
-DOWNLOAD_DIR = r"C:\Users\wangxiaoyu02\工作项目\工作报表\trae分析项目\周报结论"
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "zb_export_config.json"
+SMARTBI_BASE_URL = "https://bi.61info.cn/smartbi"
+DOWNLOAD_DIR = str(BASE_DIR)
+SUMMARY_OUTPUT_PATH = BASE_DIR / "周报结论汇总.xlsx"
+TEAM_ORDER = ["海外团队", "欧美澳", "港澳", "台湾"]
+PAGE_READY_TIMEOUT_SECONDS = 120
+PAGE_READY_POLL_SECONDS = 2
+EXPORT_DIALOG_TIMEOUT_SECONDS = 30
+EXPORT_DIALOG_POLL_SECONDS = 1
+POST_EXCEL_SELECT_WAIT_SECONDS = 2
+DOWNLOAD_READY_TIMEOUT_SECONDS = 120
+DOWNLOAD_POLL_SECONDS = 1
+FILE_STABLE_CHECK_ROUNDS = 2
+REPORT_RULES = [
+    {"label": "1）一单结课续费率", "extract_mode": "fixed_rows_i"},
+    {"label": "2）统合结课续费率", "extract_mode": "scan_rows_m"},
+    {"label": "3）一续升舱续费率", "extract_mode": "summary_block_h"},
+    {"label": "4）统合早鸟续费率", "extract_mode": "summary_block_h"},
+]
+
+
+def load_auth_config():
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(f"未找到配置文件: {CONFIG_PATH}")
+
+    try:
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"配置文件 JSON 解析失败: {CONFIG_PATH}") from exc
+
+    username = str(config.get("username", "")).strip()
+    password = str(config.get("password", "")).strip()
+    report_ids = config.get("report_ids", [])
+    if not username or not password:
+        raise ValueError(f"配置文件缺少 username 或 password: {CONFIG_PATH}")
+    if not isinstance(report_ids, list) or len(report_ids) < len(REPORT_RULES):
+        raise ValueError(f"配置文件缺少至少 {len(REPORT_RULES)} 个 report_ids: {CONFIG_PATH}")
+
+    normalized_report_ids = [str(item).strip() for item in report_ids if str(item).strip()]
+    if len(normalized_report_ids) < len(REPORT_RULES):
+        raise ValueError(f"配置文件中的 report_ids 至少需要 {len(REPORT_RULES)} 个有效报表ID: {CONFIG_PATH}")
+
+    return username, password, normalized_report_ids
+
+
+def build_report_url(report_id):
+    return f"{SMARTBI_BASE_URL}/vision/openresource.jsp?resid={report_id}"
 
 def get_timestamp_filename(original_name):
     """在文件名后添加年月日时间戳"""
@@ -25,169 +70,253 @@ def get_timestamp_filename(original_name):
     new_name = f"{name}--{date_str}{ext}"
     return new_name
 
-def analyze_report_and_add_conclusion(file_path):
-    """分析报表数据并在Sheet2中添加结论"""
+
+def format_rate(value):
+    if value is None:
+        return "%"
+    if isinstance(value, (int, float)):
+        return f"{value * 100:.2f}%"
+    return str(value)
+
+
+def build_conclusion_line(label, team_rates):
+    return (
+        f"{label}：整体 {team_rates.get('海外团队', '%')}（MTD目标 %，月目标 %），"
+        f"欧美澳 {team_rates.get('欧美澳', '%')}（MTD目标 %，月目标 %），"
+        f"港澳 {team_rates.get('港澳', '%')}（MTD目标 %，月目标 %），"
+        f"台湾 {team_rates.get('台湾', '%')}（MTD目标 %，月目标 %）；"
+    )
+
+
+def write_summary_workbook(conclusion_lines):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Sheet1"
+    default_font = openpyxl.styles.Font(name='微软雅黑', size=11)
+
+    for row_index, line in enumerate(conclusion_lines, start=1):
+        cell = sheet.cell(row=row_index, column=1, value=line)
+        cell.font = default_font
+
+    sheet.column_dimensions["A"].width = 120
+    workbook.save(SUMMARY_OUTPUT_PATH)
+
+
+def extract_team_rates_fixed_rows(sheet1):
+    team_rows = {
+        "海外团队": 6,
+        "港澳": 7,
+        "台湾": 8,
+        "欧美澳": 9,
+    }
+    team_rates = {team: "%" for team in TEAM_ORDER}
+    print("- 数据提取详情:")
+    for team_name, row_num in team_rows.items():
+        if row_num <= sheet1.max_row:
+            cell_b = sheet1.cell(row=row_num, column=2).value
+            cell_i = sheet1.cell(row=row_num, column=9).value
+            print(f"  行{row_num}: B{row_num}='{cell_b}', I{row_num}='{cell_i}'")
+            team_rates[team_name] = format_rate(cell_i)
+    return team_rates
+
+
+def extract_team_rates_scan_rows(sheet1):
+    team_rates = {}
+    print("- 数据提取详情:")
+    for row in range(6, min(30, sheet1.max_row + 1)):
+        cell_b = sheet1.cell(row=row, column=2).value
+        cell_m = sheet1.cell(row=row, column=13).value
+        if cell_b:
+            cell_b_str = str(cell_b).strip()
+            for team in TEAM_ORDER:
+                if team in cell_b_str and team not in team_rates:
+                    rate_str = format_rate(cell_m)
+                    team_rates[team] = rate_str
+                    print(f"  行{row}: B{row}='{cell_b}', M{row}='{cell_m}' → {team}: {rate_str}")
+    return {team: team_rates.get(team, "%") for team in TEAM_ORDER}
+
+
+def extract_team_rates_summary_block(sheet1):
+    team_rows = {
+        "海外团队": 5,
+        "港澳": 6,
+        "台湾": 7,
+        "欧美澳": 8,
+    }
+    team_rates = {team: "%" for team in TEAM_ORDER}
+    target_column = None
+    target_headers = {"当前续费率", "目前续费率"}
+    for column_index in range(1, sheet1.max_column + 1):
+        header_value = sheet1.cell(row=4, column=column_index).value
+        header_text = str(header_value).strip() if header_value is not None else ""
+        if header_text in target_headers:
+            target_column = column_index
+            break
+
+    if target_column is None:
+        raise ValueError("未在汇总板块找到【当前续费率/目前续费率】字段。")
+
+    print("- 数据提取详情:")
+    for team_name, row_num in team_rows.items():
+        if row_num <= sheet1.max_row:
+            cell_b = sheet1.cell(row=row_num, column=2).value
+            cell_value = sheet1.cell(row=row_num, column=target_column).value
+            print(f"  行{row_num}: B{row_num}='{cell_b}', col{target_column}='{cell_value}'")
+            team_rates[team_name] = format_rate(cell_value)
+    return team_rates
+
+
+def analyze_report_and_build_conclusion(file_path, report_rule):
+    """分析报表数据并生成结论文本"""
     try:
-        # 用data_only=True打开文件，读取公式计算后的数值
-        workbook_data = openpyxl.load_workbook(file_path, data_only=True)
+        workbook_data = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
         sheet1 = workbook_data.active
-        
-        print("\n📋 报表结构分析：")
+
+        print(f"\n📋 报表结构分析：{report_rule['label']}")
         print(f"- 表格行数: {sheet1.max_row}")
         print(f"- 表格列数: {sheet1.max_column}")
-        
-        team_data = {
-            "海外团队": 6,
-            "港澳": 7,
-            "台湾": 8,
-            "欧美澳": 9
-        }
-        
-        overseas_team_rate = "%"
-        europe_rate = "%"
-        hk_macau_rate = "%"
-        taiwan_rate = "%"
-        
-        print("- 数据提取详情:")
-        for team_name, row_num in team_data.items():
-            if row_num <= sheet1.max_row:
-                cell_b = sheet1.cell(row=row_num, column=2).value
-                cell_i = sheet1.cell(row=row_num, column=9).value
-                
-                print(f"  行{row_num}: B{row_num}='{cell_b}', I{row_num}='{cell_i}'")
-                
-                rate_str = "%"
-                if cell_i is not None:
-                    if isinstance(cell_i, (int, float)):
-                        rate_str = f"{cell_i * 100:.2f}%"
-                    else:
-                        rate_str = str(cell_i)
-                
-                if team_name == "海外团队":
-                    overseas_team_rate = rate_str
-                elif team_name == "欧美澳":
-                    europe_rate = rate_str
-                elif team_name == "港澳":
-                    hk_macau_rate = rate_str
-                elif team_name == "台湾":
-                    taiwan_rate = rate_str
-        
-        workbook_data.close()
-        
-        # 重新打开文件（不带data_only），以便写入Sheet2
-        workbook = openpyxl.load_workbook(file_path)
-        
-        if 'Sheet2' in workbook.sheetnames:
-            sheet2 = workbook['Sheet2']
+
+        if report_rule["extract_mode"] == "fixed_rows_i":
+            team_rates = extract_team_rates_fixed_rows(sheet1)
+        elif report_rule["extract_mode"] == "summary_block_h":
+            team_rates = extract_team_rates_summary_block(sheet1)
         else:
-            sheet2 = workbook.create_sheet('Sheet2')
-        
-        sheet2.delete_rows(1, sheet2.max_row)
-        
-        default_font = openpyxl.styles.Font(name='微软雅黑', size=11)
-        
-        conclusion_line1 = f"1）一单结课续费率：整体 {overseas_team_rate}（MTD目标 ，本月目标 ），欧美澳 {europe_rate}（MTD目标 ，本月目标 ），港澳 {hk_macau_rate}（MTD目标 ，本月目标 ），台湾 {taiwan_rate}（MTD目标 ，本月目标 ）；"
-        
-        sheet2['A1'] = conclusion_line1
-        sheet2['A1'].font = default_font
-        
-        workbook.save(file_path)
-        print(f"✓ 已添加分析结论到Sheet2")
-        
+            team_rates = extract_team_rates_scan_rows(sheet1)
+
+        workbook_data.close()
+
+        conclusion_line = build_conclusion_line(report_rule["label"], team_rates)
+        print("✓ 已生成报表结论")
+
         print("\n📊 分析结论预览：")
-        print(f"  {conclusion_line1}")
-        
+        print(f"  {conclusion_line}")
+
         print("\n📈 数据提取结果：")
-        print(f"  - 海外团队续费率: {overseas_team_rate}")
-        print(f"  - 欧美澳续费率: {europe_rate}")
-        print(f"  - 港澳续费率: {hk_macau_rate}")
-        print(f"  - 台湾续费率: {taiwan_rate}")
-        
-        return True
-        
+        for team in TEAM_ORDER:
+            print(f"  - {team}续费率: {team_rates.get(team, '%')}")
+
+        return conclusion_line
+
     except Exception as e:
         print(f"⚠ 分析报表失败: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        return None
 
-def analyze_report2_and_add_conclusion(file_path):
-    """分析第二个报表数据并在Sheet2中添加结论"""
+
+def wait_for_report_ready(driver, step_label):
+    print(f"\n{step_label}: 等待页面加载")
+    max_checks = max(1, PAGE_READY_TIMEOUT_SECONDS // PAGE_READY_POLL_SECONDS)
+    for i in range(max_checks):
+        time.sleep(PAGE_READY_POLL_SECONDS)
+        try:
+            page_source = driver.page_source
+            if "btnExport" in page_source or "导出" in page_source:
+                print(f"  ✓ 页面加载完成 (第{i+1}次检查)")
+                return
+        except Exception as e:
+            print(f"  检查失败: {e}")
+        print(f"  等待中... ({i+1}/{max_checks})")
+    raise TimeoutError(f"{step_label} 超时，页面未出现导出入口。")
+
+
+def click_export_controls(driver, export_script, excel_script, online_export_script, step_base):
+    print(f"\n步骤{step_base}: 点击导出按钮")
+    result = driver.execute_script(export_script)
+    print(f"  {result}")
+
+    print("  等待导出弹窗加载...")
+    max_checks = max(1, EXPORT_DIALOG_TIMEOUT_SECONDS // EXPORT_DIALOG_POLL_SECONDS)
+    for i in range(max_checks):
+        time.sleep(EXPORT_DIALOG_POLL_SECONDS)
+        hasExcel = driver.execute_script("return document.getElementById('EXCEL2007') !== null;")
+        if hasExcel:
+            print(f"  ✓ 导出弹窗已加载 (第{i+1}次检查)")
+            break
+        print(f"  等待弹窗... ({i+1}/{max_checks})")
+    else:
+        raise TimeoutError("导出弹窗加载超时，未检测到 Excel 选项。")
+
+    print(f"\n步骤{step_base + 1}: 选择Excel")
+    result = driver.execute_script(excel_script)
+    print(f"  {result}")
+    time.sleep(POST_EXCEL_SELECT_WAIT_SECONDS)
+
+    print(f"\n步骤{step_base + 2}: 点击在线导出")
+    result = driver.execute_script(online_export_script)
+    print(f"  {result}")
+
+
+def list_download_files():
+    if not os.path.exists(DOWNLOAD_DIR):
+        return {}
+
+    files = {}
+    for file in os.listdir(DOWNLOAD_DIR):
+        file_path = os.path.join(DOWNLOAD_DIR, file)
+        if not os.path.isfile(file_path):
+            continue
+        if file.startswith("~$") or file.endswith((".crdownload", ".tmp", ".part")):
+            continue
+        files[file_path] = {
+            "name": file,
+            "ctime": os.path.getctime(file_path),
+            "size": os.path.getsize(file_path),
+        }
+    return files
+
+
+def wait_for_new_download(previous_files):
+    print("\n检查下载的文件...")
+    deadline = time.time() + DOWNLOAD_READY_TIMEOUT_SECONDS
+    stable_counter = 0
+    candidate_path = None
+    candidate_size = None
+
+    while time.time() < deadline:
+        current_files = list_download_files()
+        new_paths = [path for path in current_files if path not in previous_files]
+        if new_paths:
+            newest_path = max(new_paths, key=lambda path: current_files[path]["ctime"])
+            newest_size = current_files[newest_path]["size"]
+            if newest_path == candidate_path and newest_size == candidate_size:
+                stable_counter += 1
+            else:
+                candidate_path = newest_path
+                candidate_size = newest_size
+                stable_counter = 1
+
+            if stable_counter >= FILE_STABLE_CHECK_ROUNDS:
+                meta = current_files[newest_path]
+                print(f"✓ 最新文件: {meta['name']} (创建时间: {datetime.datetime.fromtimestamp(meta['ctime'])})")
+                return newest_path
+        time.sleep(DOWNLOAD_POLL_SECONDS)
+
+    print("⚠ 未在预期时间内检测到稳定的新下载文件")
+    return None
+
+
+def rename_latest_download(download_path):
+    if not download_path:
+        return None
+    latest_file = os.path.basename(download_path)
+    file_size = os.path.getsize(download_path)
+    new_filename = get_timestamp_filename(latest_file)
+    new_filepath = os.path.join(DOWNLOAD_DIR, new_filename)
+
     try:
-        workbook_data = openpyxl.load_workbook(file_path, data_only=True)
-        sheet1 = workbook_data.active
-        
-        print("\n📋 第二个报表结构分析：")
-        print(f"- 表格行数: {sheet1.max_row}")
-        print(f"- 表格列数: {sheet1.max_column}")
-        
-        # 在B列中搜索小组名称，从M列提取续费率
-        target_teams = ["海外团队", "欧美澳", "港澳", "台湾"]
-        team_rates = {}
-        
-        print("- 数据提取详情:")
-        for row in range(6, min(30, sheet1.max_row + 1)):
-            cell_b = sheet1.cell(row=row, column=2).value
-            cell_m = sheet1.cell(row=row, column=13).value
-            
-            if cell_b:
-                cell_b_str = str(cell_b).strip()
-                for team in target_teams:
-                    if team in cell_b_str and team not in team_rates:
-                        rate_str = "%"
-                        if cell_m is not None:
-                            if isinstance(cell_m, (int, float)):
-                                rate_str = f"{cell_m * 100:.2f}%"
-                            else:
-                                rate_str = str(cell_m)
-                        team_rates[team] = rate_str
-                        print(f"  行{row}: B{row}='{cell_b}', M{row}='{cell_m}' → {team}: {rate_str}")
-        
-        workbook_data.close()
-        
-        overseas_team_rate = team_rates.get("海外团队", "%")
-        europe_rate = team_rates.get("欧美澳", "%")
-        hk_macau_rate = team_rates.get("港澳", "%")
-        taiwan_rate = team_rates.get("台湾", "%")
-        
-        workbook = openpyxl.load_workbook(file_path)
-        
-        if 'Sheet2' in workbook.sheetnames:
-            sheet2 = workbook['Sheet2']
-        else:
-            sheet2 = workbook.create_sheet('Sheet2')
-        
-        sheet2.delete_rows(1, sheet2.max_row)
-        
-        default_font = openpyxl.styles.Font(name='微软雅黑', size=11)
-        
-        conclusion_line1 = f"2）统合结课续费率：整体 {overseas_team_rate}（MTD目标 ，本月目标 ），欧美澳 {europe_rate}（MTD目标 ，本月目标 ），港澳 {hk_macau_rate}（MTD目标 ，本月目标 ），台湾 {taiwan_rate}（MTD目标 ，本月目标 ）；"
-        
-        sheet2['A1'] = conclusion_line1
-        sheet2['A1'].font = default_font
-        
-        workbook.save(file_path)
-        print(f"✓ 已添加分析结论到Sheet2")
-        
-        print("\n📊 分析结论预览：")
-        print(f"  {conclusion_line1}")
-        
-        print("\n📈 数据提取结果：")
-        print(f"  - 海外团队续费率: {overseas_team_rate}")
-        print(f"  - 欧美澳续费率: {europe_rate}")
-        print(f"  - 港澳续费率: {hk_macau_rate}")
-        print(f"  - 台湾续费率: {taiwan_rate}")
-        
-        return True
-        
+        os.rename(download_path, new_filepath)
+        print(f"✓ 重命名: {latest_file} → {new_filename} ({file_size} 字节)")
+        print(f"✅ 文件已保存为: {new_filename}")
+        return new_filepath
     except Exception as e:
-        print(f"⚠ 分析第二个报表失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        print(f"⚠ 重命名失败: {latest_file} → {e}")
+        return None
 
 def js_export():
     print("使用JavaScript注入的导出脚本")
+    username, password, report_ids = load_auth_config()
+    conclusion_lines = []
     
     # 创建下载目录
     if not os.path.exists(DOWNLOAD_DIR):
@@ -209,9 +338,9 @@ def js_export():
     driver = webdriver.Edge(options=edge_options)
     
     try:
-        # 步骤1: 打开页面
-        print("步骤1: 打开页面")
-        driver.get(BASE_URL_1)
+        first_report_id = report_ids[0]
+        print(f"步骤1: 打开页面 | report_id={first_report_id}")
+        driver.get(build_report_url(first_report_id))
         time.sleep(5)
         
         # 步骤2: 使用JavaScript登录
@@ -222,8 +351,8 @@ def js_export():
             var loginBtn = document.querySelector('input.item-submit');
             
             if(username && password && loginBtn) {{
-                username.value = '{USERNAME}';
-                password.value = '{PASSWORD}';
+                username.value = {json.dumps(username)};
+                password.value = {json.dumps(password)};
                 loginBtn.click();
                 return '登录成功';
             }} else {{
@@ -233,21 +362,8 @@ def js_export():
         result = driver.execute_script(login_script)
         print(f"  {result}")
         
-        # 步骤3: 等待页面加载
-        print("\n步骤3: 等待页面加载")
-        for i in range(20):
-            time.sleep(8)  # 减少等待时间
-            try:
-                page_source = driver.page_source
-                if "btnExport" in page_source or "导出" in page_source:
-                    print(f"  ✓ 页面加载完成 (第{i+1}次检查)")
-                    break
-            except Exception as e:
-                print(f"  检查失败: {e}")
-            print(f"  等待中... ({i+1}/20)")
+        wait_for_report_ready(driver, "步骤3")
         
-        # 步骤4: 使用JavaScript点击导出按钮
-        print("\n步骤4: 点击导出按钮")
         export_script = """
             var exportBtn = document.querySelector('input.btnExport');
             if(!exportBtn) exportBtn = document.querySelector('input[title="导出"]');
@@ -264,22 +380,6 @@ def js_export():
                 return '导出按钮未找到';
             }
         """
-        result = driver.execute_script(export_script)
-        print(f"  {result}")
-        
-        # 等待导出弹窗加载
-        print("  等待导出弹窗加载...")
-        for i in range(10):
-            time.sleep(3)
-            hasExcel = driver.execute_script("return document.getElementById('EXCEL2007') !== null;")
-            if hasExcel:
-                print(f"  ✓ 导出弹窗已加载 (第{i+1}次检查)")
-                break
-            print(f"  等待弹窗... ({i+1}/10)")
-        time.sleep(3)
-        
-        # 步骤5: 使用JavaScript选择Excel - 精确ID定位
-        print("\n步骤5: 选择Excel")
         excel_script = """
             var foundExcel = null;
             var methodUsed = '';
@@ -443,12 +543,6 @@ def js_export():
                 return 'Excel未找到';
             }
         """
-        result = driver.execute_script(excel_script)
-        print(f"  {result}")
-        time.sleep(10)
-        
-        # 步骤6: 使用JavaScript点击在线导出 - 精确定位
-        print("\n步骤6: 点击在线导出")
         online_export_script = """
             var foundOnline = null;
             
@@ -509,156 +603,40 @@ def js_export():
                 return '在线导出未找到';
             }
         """
-        result = driver.execute_script(online_export_script)
-        print(f"  {result}")
-        time.sleep(30)
-        
-        print("\n✅ 导出完成！")
-        
-        # 检查并重命名最新下载的文件
-        print("\n检查下载的文件...")
-        time.sleep(10)  # 给文件下载一些时间
-        
-        # 获取下载目录中的文件
-        if os.path.exists(DOWNLOAD_DIR):
-            # 获取所有文件及其创建时间
-            files_info = []
-            for file in os.listdir(DOWNLOAD_DIR):
-                file_path = os.path.join(DOWNLOAD_DIR, file)
-                if os.path.isfile(file_path):
-                    create_time = os.path.getctime(file_path)
-                    files_info.append((file, file_path, create_time))
-            
-            if files_info:
-                # 按创建时间排序，获取最新文件
-                files_info.sort(key=lambda x: x[2], reverse=True)
-                latest_file, latest_path, latest_time = files_info[0]
-                
-                print(f"✓ 下载目录中共有 {len(files_info)} 个文件")
-                print(f"✓ 最新文件: {latest_file} (创建时间: {datetime.datetime.fromtimestamp(latest_time)})")
-                
-                # 只重命名最新文件
-                file_size = os.path.getsize(latest_path)
-                new_filename = get_timestamp_filename(latest_file)
-                new_filepath = os.path.join(DOWNLOAD_DIR, new_filename)
-                
-                try:
-                    os.rename(latest_path, new_filepath)
-                    print(f"✓ 重命名最新文件: {latest_file} → {new_filename} ({file_size} 字节)")
-                    print(f"✅ 文件已保存为: {new_filename}")
-                    
-                    # 分析报表并添加结论
-                    print("\n开始分析报表数据...")
-                    if analyze_report_and_add_conclusion(new_filepath):
-                        print("✅ 报表分析完成！")
-                    else:
-                        print("⚠ 报表分析失败，但文件已保存")
-                        
-                except Exception as e:
-                    print(f"⚠ 重命名失败: {latest_file} → {e}")
-                    print(f"⚠ 文件保持原名: {latest_file}")
+        for index, report_rule in enumerate(REPORT_RULES):
+            previous_files = list_download_files()
+            if index > 0:
+                print("\n" + "=" * 50)
+                print(f"开始导出第{index + 1}个报表...")
+                print("=" * 50)
+                report_id = report_ids[index]
+                open_step = 7 + (index - 1) * 4
+                print(f"\n步骤{open_step}: 打开报表页面 | report_id={report_id}")
+                driver.get(build_report_url(report_id))
+                wait_for_report_ready(driver, f"步骤{open_step + 1}")
+                click_export_controls(driver, export_script, excel_script, online_export_script, open_step + 2)
             else:
-                print("⚠ 下载目录为空，可能下载失败")
-        else:
-            print("❌ 下载目录不存在")
-        
-        # ==================== 第二个报表导出 ====================
-        print("\n" + "=" * 50)
-        print("开始导出第二个报表...")
-        print("=" * 50)
-        
-        # 步骤7: 打开第二个报表页面
-        print("\n步骤7: 打开第二个报表页面")
-        driver.get(BASE_URL_2)
-        time.sleep(5)
-        
-        # 步骤8: 等待页面加载
-        print("\n步骤8: 等待页面加载")
-        for i in range(20):
-            time.sleep(8)
-            try:
-                page_source = driver.page_source
-                if "btnExport" in page_source or "导出" in page_source:
-                    print(f"  ✓ 页面加载完成 (第{i+1}次检查)")
-                    break
-            except Exception as e:
-                print(f"  检查失败: {e}")
-            print(f"  等待中... ({i+1}/20)")
-        
-        # 步骤9: 点击导出按钮
-        print("\n步骤9: 点击导出按钮")
-        result = driver.execute_script(export_script)
-        print(f"  {result}")
-        
-        # 等待导出弹窗加载
-        print("  等待导出弹窗加载...")
-        for i in range(10):
-            time.sleep(3)
-            hasExcel = driver.execute_script("return document.getElementById('EXCEL2007') !== null;")
-            if hasExcel:
-                print(f"  ✓ 导出弹窗已加载 (第{i+1}次检查)")
-                break
-            print(f"  等待弹窗... ({i+1}/10)")
-        time.sleep(3)
-        
-        # 步骤10: 选择Excel
-        print("\n步骤10: 选择Excel")
-        result = driver.execute_script(excel_script)
-        print(f"  {result}")
-        time.sleep(10)
-        
-        # 步骤11: 点击在线导出
-        print("\n步骤11: 点击在线导出")
-        result = driver.execute_script(online_export_script)
-        print(f"  {result}")
-        time.sleep(30)
-        
-        print("\n✅ 第二个报表导出完成！")
-        
-        # 检查并重命名最新下载的文件
-        print("\n检查第二个报表下载的文件...")
-        time.sleep(10)
-        
-        if os.path.exists(DOWNLOAD_DIR):
-            files_info = []
-            for file in os.listdir(DOWNLOAD_DIR):
-                file_path = os.path.join(DOWNLOAD_DIR, file)
-                if os.path.isfile(file_path):
-                    create_time = os.path.getctime(file_path)
-                    files_info.append((file, file_path, create_time))
-            
-            if files_info:
-                files_info.sort(key=lambda x: x[2], reverse=True)
-                latest_file, latest_path, latest_time = files_info[0]
-                
-                # 检查是否是刚下载的新文件（创建时间在最近2分钟内）
-                time_diff = time.time() - latest_time
-                if time_diff > 120:
-                    print("⚠ 未检测到新下载的文件")
-                else:
-                    print(f"✓ 最新文件: {latest_file} (创建时间: {datetime.datetime.fromtimestamp(latest_time)})")
-                    
-                    file_size = os.path.getsize(latest_path)
-                    new_filename = get_timestamp_filename(latest_file)
-                    new_filepath = os.path.join(DOWNLOAD_DIR, new_filename)
-                    
-                    try:
-                        os.rename(latest_path, new_filepath)
-                        print(f"✓ 重命名: {latest_file} → {new_filename} ({file_size} 字节)")
-                        print(f"✅ 第二个报表已保存为: {new_filename}")
-                        
-                        print("\n开始分析第二个报表数据...")
-                        if analyze_report2_and_add_conclusion(new_filepath):
-                            print("✅ 第二个报表分析完成！")
-                        else:
-                            print("⚠ 第二个报表分析失败，但文件已保存")
-                            
-                    except Exception as e:
-                        print(f"⚠ 重命名失败: {latest_file} → {e}")
+                report_id = report_ids[index]
+                click_export_controls(driver, export_script, excel_script, online_export_script, 4)
+
+            print(f"\n✅ 第{index + 1}个报表导出完成！")
+            download_path = wait_for_new_download(previous_files)
+            new_filepath = rename_latest_download(download_path)
+            if not new_filepath:
+                print("⚠ 未完成文件重命名或未检测到新文件")
+                continue
+
+            print("\n开始分析报表数据...")
+            conclusion_line = analyze_report_and_build_conclusion(new_filepath, report_rule)
+            if conclusion_line:
+                conclusion_lines.append(conclusion_line)
+                print("✅ 报表分析完成！")
             else:
-                print("⚠ 下载目录为空，可能下载失败")
-        else:
-            print("❌ 下载目录不存在")
+                print("⚠ 报表分析失败，但文件已保存")
+
+        if conclusion_lines:
+            write_summary_workbook(conclusion_lines)
+            print(f"\n✅ 周报结论已汇总到: {SUMMARY_OUTPUT_PATH}")
         
     except Exception as e:
         print(f"\n❌ 错误: {e}")
